@@ -88,6 +88,7 @@ fields("metrics_status_fields") ->
 fields("metrics") ->
     [
         {"total", ?HOCON(integer(), #{desc => ?DESC("metrics_total")})},
+        {"ignore", ?HOCON(integer(), #{desc => ?DESC("ignore")})},
         {"allow", ?HOCON(integer(), #{desc => ?DESC("allow")})},
         {"deny", ?HOCON(integer(), #{desc => ?DESC("deny")})},
         {"nomatch", ?HOCON(float(), #{desc => ?DESC("nomatch")})}
@@ -169,7 +170,12 @@ api_authz_refs() ->
 authz_common_fields(Type) ->
     [
         {type, ?HOCON(Type, #{required => true, desc => ?DESC(type)})},
-        {enable, ?HOCON(boolean(), #{default => true, desc => ?DESC(enable)})}
+        {enable,
+            ?HOCON(boolean(), #{
+                default => true,
+                importance => ?IMPORTANCE_NO_DOC,
+                desc => ?DESC(enable)
+            })}
     ].
 
 source_types() ->

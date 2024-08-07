@@ -56,7 +56,8 @@
     ensure_stopped/0,
     ensure_stopped/1,
     restart/1,
-    list/0
+    list/0,
+    list/1
 ]).
 
 %% Plugin config APIs
@@ -73,6 +74,7 @@
     decode_plugin_config_map/2,
     install_dir/0,
     avsc_file_path/1,
+    md5sum_file/1,
     with_plugin_avsc/1
 ]).
 
@@ -356,13 +358,13 @@ get_config_bin(NameVsn) ->
 %% RPC call from Management API or CLI.
 %% The plugin config Json Map was valid by avro schema
 %% Or: if no and plugin config ALWAYS be valid before calling this function.
-put_config(NameVsn, ConfigJsonMap, AvroValue) when not is_binary(NameVsn) ->
+put_config(NameVsn, ConfigJsonMap, AvroValue) when (not is_binary(NameVsn)) ->
     put_config(bin(NameVsn), ConfigJsonMap, AvroValue);
 put_config(NameVsn, ConfigJsonMap, _AvroValue) ->
     HoconBin = hocon_pp:do(ConfigJsonMap, #{}),
     ok = backup_and_write_hocon_bin(NameVsn, HoconBin),
-    %% TODO: callback in plugin's on_config_changed (config update by mgmt API)
     %% TODO: callback in plugin's on_config_upgraded (config vsn upgrade v1 -> v2)
+    ok = maybe_call_on_config_changed(NameVsn, ConfigJsonMap),
     ok = persistent_term:put(?PLUGIN_PERSIS_CONFIG_KEY(NameVsn), ConfigJsonMap),
     ok.
 
@@ -373,17 +375,58 @@ restart(NameVsn) ->
         {error, Reason} -> {error, Reason}
     end.
 
+%% @doc Call plugin's callback on_config_changed/2
+maybe_call_on_config_changed(NameVsn, NewConf) ->
+    FuncName = on_config_changed,
+    maybe
+        {ok, PluginAppModule} ?= app_module_name(NameVsn),
+        true ?= erlang:function_exported(PluginAppModule, FuncName, 2),
+        {ok, OldConf} = get_config(NameVsn),
+        try erlang:apply(PluginAppModule, FuncName, [OldConf, NewConf]) of
+            _ -> ok
+        catch
+            Class:CatchReason:Stacktrace ->
+                ?SLOG(error, #{
+                    msg => "failed_to_call_on_config_changed",
+                    exception => Class,
+                    reason => CatchReason,
+                    stacktrace => Stacktrace
+                }),
+                ok
+        end
+    else
+        {error, Reason} ->
+            ?SLOG(info, #{msg => "failed_to_call_on_config_changed", reason => Reason});
+        false ->
+            ?SLOG(info, #{msg => "on_config_changed_callback_not_exported"});
+        _ ->
+            ok
+    end.
+
+app_module_name(NameVsn) ->
+    case read_plugin_info(NameVsn, #{}) of
+        {ok, #{<<"name">> := Name} = _PluginInfo} ->
+            emqx_utils:safe_to_existing_atom(<<Name/binary, "_app">>);
+        {error, Reason} ->
+            ?SLOG(error, Reason#{msg => "failed_to_read_plugin_info"}),
+            {error, Reason}
+    end.
+
 %% @doc List all installed plugins.
 %% Including the ones that are installed, but not enabled in config.
 -spec list() -> [plugin_info()].
 list() ->
+    list(normal).
+
+-spec list(all | normal | hidden) -> [plugin_info()].
+list(Type) ->
     Pattern = filename:join([install_dir(), "*", "release.json"]),
     All = lists:filtermap(
         fun(JsonFilePath) ->
             [_, NameVsn | _] = lists:reverse(filename:split(JsonFilePath)),
             case read_plugin_info(NameVsn, #{}) of
                 {ok, Info} ->
-                    {true, Info};
+                    filter_plugin_of_type(Type, Info);
                 {error, Reason} ->
                     ?SLOG(warning, Reason#{msg => "failed_to_read_plugin_info"}),
                     false
@@ -392,6 +435,17 @@ list() ->
         filelib:wildcard(Pattern)
     ),
     do_list(configured(), All).
+
+filter_plugin_of_type(all, Info) ->
+    {true, Info};
+filter_plugin_of_type(normal, #{<<"hidden">> := true}) ->
+    false;
+filter_plugin_of_type(normal, Info) ->
+    {true, Info};
+filter_plugin_of_type(hidden, #{<<"hidden">> := true} = Info) ->
+    {true, Info};
+filter_plugin_of_type(hidden, _Info) ->
+    false.
 
 %%--------------------------------------------------------------------
 %% Package utils
@@ -661,10 +715,6 @@ do_list([#{name_vsn := NameVsn} | Rest], All) ->
     end,
     case lists:splitwith(SplitF, All) of
         {_, []} ->
-            ?SLOG(warning, #{
-                msg => "configured_plugin_not_installed",
-                name_vsn => NameVsn
-            }),
             do_list(Rest, All);
         {Front, [I | Rear]} ->
             [I | do_list(Rest, Front ++ Rear)]
@@ -736,7 +786,8 @@ do_read_plugin(NameVsn, InfoFilePath, Options) ->
     {ok, PlainMap} = (read_file_fun(InfoFilePath, "bad_info_file", #{read_mode => ?JSON_MAP}))(),
     Info0 = check_plugin(PlainMap, NameVsn, InfoFilePath),
     Info1 = plugins_readme(NameVsn, Options, Info0),
-    plugin_status(NameVsn, Info1).
+    Info2 = plugins_package_info(NameVsn, Info1),
+    plugin_status(NameVsn, Info2).
 
 read_plugin_avsc(NameVsn) ->
     read_plugin_avsc(NameVsn, #{read_mode => ?JSON_MAP}).
@@ -835,6 +886,12 @@ get_plugin_config_from_any_node([Node | T], NameVsn, Errors) ->
             Res;
         Err ->
             get_plugin_config_from_any_node(T, NameVsn, [{Node, Err} | Errors])
+    end.
+
+plugins_package_info(NameVsn, Info) ->
+    case file:read_file(md5sum_file(NameVsn)) of
+        {ok, MD5} -> Info#{md5sum => MD5};
+        _ -> Info#{md5sum => <<>>}
     end.
 
 plugins_readme(NameVsn, #{fill_readme := true}, Info) ->
@@ -992,19 +1049,22 @@ do_load_plugin_app(AppName, Ebin) ->
     end.
 
 start_app(App) ->
-    case application:ensure_all_started(App) of
-        {ok, Started} ->
+    case run_with_timeout(application, ensure_all_started, [App], 10_000) of
+        {ok, {ok, Started}} ->
             case Started =/= [] of
                 true -> ?SLOG(debug, #{msg => "started_plugin_apps", apps => Started});
                 false -> ok
-            end,
-            ?SLOG(debug, #{msg => "started_plugin_app", app => App}),
-            ok;
-        {error, {ErrApp, Reason}} ->
+            end;
+        {ok, {error, Reason}} ->
+            throw(#{
+                msg => "failed_to_start_app",
+                app => App,
+                reason => Reason
+            });
+        {error, Reason} ->
             throw(#{
                 msg => "failed_to_start_plugin_app",
                 app => App,
-                err_app => ErrApp,
                 reason => Reason
             })
     end.
@@ -1489,6 +1549,10 @@ default_plugin_config_file(NameVsn) ->
 i18n_file_path(NameVsn) ->
     wrap_to_list(filename:join([plugin_priv_dir(NameVsn), "config_i18n.json"])).
 
+-spec md5sum_file(name_vsn()) -> string().
+md5sum_file(NameVsn) ->
+    plugin_dir(NameVsn) ++ ".tar.gz.md5sum".
+
 -spec readme_file(name_vsn()) -> string().
 readme_file(NameVsn) ->
     wrap_to_list(filename:join([plugin_dir(NameVsn), "README.md"])).
@@ -1525,3 +1589,20 @@ bin(B) when is_binary(B) -> B.
 
 wrap_to_list(Path) ->
     binary_to_list(iolist_to_binary(Path)).
+
+run_with_timeout(Module, Function, Args, Timeout) ->
+    Self = self(),
+    Fun = fun() ->
+        Result = apply(Module, Function, Args),
+        Self ! {self(), Result}
+    end,
+    Pid = spawn(Fun),
+    TimerRef = erlang:send_after(Timeout, self(), {timeout, Pid}),
+    receive
+        {Pid, Result} ->
+            _ = erlang:cancel_timer(TimerRef),
+            {ok, Result};
+        {timeout, Pid} ->
+            exit(Pid, kill),
+            {error, timeout}
+    end.
